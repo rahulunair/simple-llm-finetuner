@@ -51,7 +51,7 @@ parser.add_argument('--port', type=int, default=7860, help='Host port to launch 
 args = parser.parse_args()
 
 MODELS = args.models
-DEVICE_MAP = {str(i): torch.device(f"xpu:{i}") for i in range(8)} #{'': 0} if not args.device_map else args.device_map
+DEVICE_MAP = {'': torch.device("xpu") }#{'': 0} if not args.device_map else args.device_map
 MODEL = args.model
 
 TRAINING_PARAMS = {

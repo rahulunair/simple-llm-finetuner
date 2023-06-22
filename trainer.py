@@ -234,7 +234,7 @@ class Trainer():
         else:
             training_args = transformers.TrainingArguments(
                 per_device_train_batch_size=kwargs['micro_batch_size'],
-                per_device_eval_batch_size=kwargs['micro_batch_size'] * 5
+                per_device_eval_batch_size=kwargs['micro_batch_size'] * 5,
                 gradient_accumulation_steps=kwargs['gradient_accumulation_steps'],
                 num_train_epochs=kwargs['epochs'],
                 learning_rate=kwargs['learning_rate'],
