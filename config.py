@@ -1,8 +1,17 @@
 import argparse
 import torch
+try:
+    import intel_extension_for_pytorch
+except ImportError:
+    pass
 
 HAS_CUDA = torch.cuda.is_available()
-DEVICE = torch.device('cuda' if HAS_CUDA else 'cpu')
+try:
+    HAS_XPU = torch.xpu.is_available()
+except:
+    HAS_XPU = False
+
+DEVICE = torch.device('cuda' if HAS_CUDA else 'xpu' if HAS_XPU else 'cpu')
 
 parser = argparse.ArgumentParser(description='Simple LLM Finetuner')
 
@@ -12,7 +21,8 @@ parser.add_argument('--models',
         'decapoda-research/llama-7b-hf', 
         'cerebras/Cerebras-GPT-2.7B', 
         'cerebras/Cerebras-GPT-1.3B', 
-        'EleutherAI/gpt-neo-2.7B'
+        'EleutherAI/gpt-neo-2.7B',
+        'openlm-research/open_llama_7b' 
     ],  
     help='List of models to use'
 )
@@ -20,8 +30,8 @@ parser.add_argument('--models',
 parser.add_argument('--device-map', type=str, default='', help='Device map to use')
 parser.add_argument('--model', type=str, default='cerebras/Cerebras-GPT-2.7B', help='Model to use')
 parser.add_argument('--max-seq-length', type=int, default=256, help='Max sequence length')
-parser.add_argument('--micro-batch-size', type=int, default=12, help='Micro batch size')
-parser.add_argument('--gradient-accumulation-steps', type=int, default=8, help='Gradient accumulation steps')
+parser.add_argument('--micro-batch-size', type=int, default=4, help='Micro batch size')
+parser.add_argument('--gradient-accumulation-steps', type=int, default=32, help='Gradient accumulation steps')
 parser.add_argument('--epochs', type=int, default=3, help='Number of epochs')
 parser.add_argument('--learning-rate', type=float, default=3e-4, help='Learning rate')
 parser.add_argument('--lora-r', type=int, default=8, help='LORA r')
@@ -41,7 +51,7 @@ parser.add_argument('--port', type=int, default=7860, help='Host port to launch 
 args = parser.parse_args()
 
 MODELS = args.models
-DEVICE_MAP = {'': 0} if not args.device_map else args.device_map
+DEVICE_MAP = {str(i): torch.device(f"xpu:{i}") for i in range(8)} #{'': 0} if not args.device_map else args.device_map
 MODEL = args.model
 
 TRAINING_PARAMS = {

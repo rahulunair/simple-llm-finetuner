@@ -1,6 +1,10 @@
 import os
 import gc
 import torch
+try:
+    import intel_extension_for_pytorch
+except ImportError:
+    pass
 import transformers
 import peft
 import datasets
@@ -8,6 +12,7 @@ from contextlib import nullcontext
 
 from config import (
     HAS_CUDA, 
+    HAS_XPU,
     MODEL, 
     DEVICE_MAP, 
     TRAINING_PARAMS, 
@@ -38,7 +43,9 @@ class Trainer():
         if (HAS_CUDA):
             with torch.no_grad():
                 torch.cuda.empty_cache()
-
+        if HAS_XPU:
+            with torch.no_grad():
+                torch.xpu.empty_cache()
         gc.collect()
 
     def load_model(self, model_name, force=False, **kwargs):
@@ -50,16 +57,23 @@ class Trainer():
         if (self.model is not None):
             self.unload_model()
 
-        self.model = transformers.AutoModelForCausalLM.from_pretrained(
-            model_name,
-            device_map=DEVICE_MAP,
-            load_in_8bit=True,
-            torch_dtype=torch.float16,
-        )
+        if not HAS_XPU:
+            self.model = transformers.AutoModelForCausalLM.from_pretrained(
+                model_name,
+                device_map=DEVICE_MAP,
+                load_in_8bit=True,
+                torch_dtype=torch.float16,
+            )
+        else:
+            self.model = transformers.AutoModelForCausalLM.from_pretrained(
+                model_name,
+                device_map=DEVICE_MAP,
+                torch_dtype=torch.float32,
+            )
         #Clear the collection that tracks which adapters are loaded, as they are associated with self.model
         self.loras = {}
 
-        if model_name.startswith('decapoda-research/llama'):
+        if model_name.startswith('decapoda-research/llama') or model_name.startswith('openlm-research/open_llama_7b'):
             self.tokenizer = transformers.LlamaTokenizer.from_pretrained(model_name)
         else:
             self.tokenizer = transformers.AutoTokenizer.from_pretrained(model_name)
@@ -95,9 +109,6 @@ class Trainer():
             self.model = peft.PeftModel.from_pretrained(self.model, lora_name, adapter_name=lora_name)
             
         self.model.set_adapter(lora_name)
-        if (self.model_name.startswith('cerebras')):
-            self.model.half()
-
         self.lora_name = lora_name
         self.loras[lora_name] = True
 
@@ -146,7 +157,6 @@ class Trainer():
             max_length=max_seq_length,
             padding="max_length",
         )
-
         result = {
             "input_ids": result["input_ids"][:-1],
             "attention_mask": result["attention_mask"][:-1],
@@ -169,15 +179,14 @@ class Trainer():
             return { 'text': text }
 
         samples = [to_dict(x) for x in samples]
-
-        training_dataset = datasets.Dataset.from_list(samples)
-        training_dataset = training_dataset.shuffle().map(
+        dataset = datasets.Dataset.from_list(samples)
+        dataset = dataset.train_test_split(test_size=0.1)  # adjust test_size as needed
+        dataset = dataset.shuffle().map(
             lambda x: self.tokenize_sample(x, max_seq_length), 
             batched=False
         )
-
-        return training_dataset
-
+        return dataset["train"], dataset["test"]
+    
     def train(self, training_text=None, new_peft_model_name=None, **kwargs):
         assert self.should_abort is False
         assert self.model is not None
@@ -189,12 +198,13 @@ class Trainer():
         self.lora_name = None
         self.loras = {}
 
-        train_dataset = self.tokenize_training_text(training_text, **kwargs)
+        train_dataset, eval_dataset = self.tokenize_training_text(training_text, **kwargs)
 
         if hasattr(self.model, 'disable_adapter'):
             self.load_model(self.model_name, force=True)
-            
-        self.model = peft.prepare_model_for_int8_training(self.model)
+
+        if not HAS_XPU:
+            self.model = peft.prepare_model_for_int8_training(self.model)
         self.model = peft.get_peft_model(self.model, peft.LoraConfig(
             r=kwargs['lora_r'],
             lora_alpha=kwargs['lora_alpha'],
@@ -209,22 +219,37 @@ class Trainer():
         sanitized_model_name = self.model_name.replace('/', '_').replace('.', '_')
         output_dir = f"lora/{sanitized_model_name}_{new_peft_model_name}"
 
-        training_args = transformers.TrainingArguments(
-            per_device_train_batch_size=kwargs['micro_batch_size'], 
-            gradient_accumulation_steps=kwargs['gradient_accumulation_steps'],
-            num_train_epochs=kwargs['epochs'],
-            learning_rate=kwargs['learning_rate'],
-            fp16=True,  
-            optim='adamw_torch',
-            logging_steps=20, 
-            save_total_limit=3,  
-            output_dir=output_dir, 
-        )
-
-        # _trainer = self
-        # class LoggingCallback(transformers.TrainerCallback):
-        #     def on_log(self, args, state, control, logs=None, **kwargs):
-        #         _trainer.log += json.dumps(logs) + '\n'
+        if not HAS_XPU:
+            training_args = transformers.TrainingArguments(
+                per_device_train_batch_size=kwargs['micro_batch_size'], 
+                gradient_accumulation_steps=kwargs['gradient_accumulation_steps'],
+                num_train_epochs=kwargs['epochs'],
+                learning_rate=kwargs['learning_rate'],
+                fp16=True,  
+                optim='adamw_torch',
+                logging_steps=20, 
+                save_total_limit=3,  
+                output_dir=output_dir, 
+            )
+        else:
+            training_args = transformers.TrainingArguments(
+                per_device_train_batch_size=kwargs['micro_batch_size'],
+                per_device_eval_batch_size=kwargs['micro_batch_size'] * 5
+                gradient_accumulation_steps=kwargs['gradient_accumulation_steps'],
+                num_train_epochs=kwargs['epochs'],
+                learning_rate=kwargs['learning_rate'],
+                bf16=True,  
+                optim='adamw_torch',
+                eval_steps=100,
+                logging_steps=20, 
+                save_total_limit=3,  
+                output_dir=output_dir, 
+                report_to="wandb",
+                no_cuda=True,
+                use_xpu=True,
+                use_ipex=True
+                
+            )
 
         def should_abort():
             return self.should_abort
@@ -244,23 +269,10 @@ class Trainer():
                     control.should_save = False
 
 
-        # class CustomTrainer(transformers.Trainer):
-        #     def __init__(self, *args, **kwargs):
-        #         super().__init__(*args, **kwargs)
-        #         self.abort_training = False
-
-        #     def stop_training(self):
-        #         print("Stopping training...")
-        #         self.abort_training = True
-
-        #     def training_step(self, model, inputs):
-        #         if self.abort_training:
-        #             raise RuntimeError("Training aborted.")
-        #         return super().training_step(model, inputs)
-
         self.trainer = transformers.Trainer(
             model=self.model, 
-            train_dataset=train_dataset, 
+            train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
             args=training_args, 
             data_collator=transformers.DataCollatorForLanguageModeling( 
                 self.tokenizer,  
